@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+"""
+CAN bus: sharp vs slow edge simulation
+======================================
+Shows how a slow rise/fall time on the CAN differential signal delays the bus
+and causes bit errors when the transmitter checks its own bit at the sample point.
+
+Model
+-----
+* Each edge is a first-order RC response: tau = t_10-90 / 2.2
+* Dominant (logic 0) ~ 2 V differential, recessive (logic 1) ~ 0 V
+* Receiver threshold = 0.7 V (dominant if Vdiff > 0.7 V)
+* Loop delay = 2 * bus propagation (5 ns/m) + transceiver delay (TX + RX)
+* The node samples the bus at (sample point % x bit time) and compares it with
+  the bit it sent (CAN bit monitoring). A mismatch is a bit error.
+
+Usage
+-----
+    pip install numpy matplotlib
+    python can_edge_sim.py                       # defaults, 1 Mbit/s
+    python can_edge_sim.py --bitrate 125         # slower bus, slow edge works too
+    python can_edge_sim.py --slow 1500 --length 60 --sample-point 80
+    python can_edge_sim.py --sweep               # error count vs bit rate
+    python can_edge_sim.py --no-show             # only save PNG files
+"""
+import argparse
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+V_DOM = 2.0         # dominant differential voltage (V)
+V_THR = 0.7         # receiver threshold (V)
+PROP_NS_PER_M = 5.0  # cable propagation delay
+TRANSCEIVER_NS = 150.0  # TX + RX transceiver delay (loop)
+
+# SOF + identifier + control/data bits (0 = dominant, 1 = recessive)
+BITS = np.array([0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 1, 1,
+                 0, 1, 0, 1, 0, 1, 1, 0, 0, 1, 0, 1])
+
+
+def simulate(t10_90_ns, bitrate_kbps, length_m, sample_point, dt=2.0):
+    """Simulate the bus voltage seen by the transmitting node.
+
+    All times are in ns. Returns a dict with waveform, samples and metrics.
+    """
+    bit_time = 1e9 / (bitrate_kbps * 1e3)
+    tau = t10_90_ns / 2.2
+    delay = 2 * length_m * PROP_NS_PER_M + TRANSCEIVER_NS
+
+    t = np.arange(0, len(BITS) * bit_time, dt)
+    # transmitted bit shifted by the loop delay (bus idle/recessive before that)
+    idx = np.floor((t - delay) / bit_time).astype(int)
+    sent = np.where(idx < 0, 1, BITS[np.clip(idx, 0, len(BITS) - 1)])
+    target = np.where(sent == 0, V_DOM, 0.0)
+
+    # first-order RC: v[n] = v[n-1] + (target - v[n-1]) * (1 - exp(-dt/tau))
+    alpha = 1 - np.exp(-dt / tau)
+    v = np.empty_like(t)
+    x = 0.0
+    for i, tg in enumerate(target):
+        x += (tg - x) * alpha
+        v[i] = x
+
+    # sample every bit at the sample point
+    t_s = np.arange(len(BITS)) * bit_time + sample_point / 100 * bit_time
+    v_s = v[np.minimum(np.round(t_s / dt).astype(int), len(v) - 1)]
+    sampled = np.where(v_s > V_THR, 0, 1)
+    errors = sampled != BITS
+
+    # analytic edge time to threshold and timing budget
+    t_rise = tau * np.log(1 / (1 - V_THR / V_DOM))   # recessive -> dominant
+    t_fall = tau * np.log(V_DOM / V_THR)             # dominant -> recessive (slower)
+    worst = delay + max(t_rise, t_fall)
+    budget = sample_point / 100 * bit_time
+    max_br = sample_point / 100 / (worst * 1e-9) / 1e3  # kbit/s
+
+    return dict(t=t, v=v, bit_time=bit_time, t_s=t_s, v_s=v_s, sampled=sampled,
+                errors=errors, delay=delay, t_rise=t_rise, t_fall=t_fall,
+                worst=worst, budget=budget, margin=budget - worst, max_br=max_br)
+
+
+def plot_scope(ax, res, title, color):
+    bt = res["bit_time"]
+    # ideal transmitted bits
+    ideal_t = np.repeat(np.arange(len(BITS) + 1) * bt, 2)[1:-1]
+    ideal_v = np.repeat(np.where(BITS == 0, V_DOM, 0.0), 2)
+    ax.plot(ideal_t / 1e3, ideal_v, color="gray", lw=1.2, alpha=0.7, label="ideal bits sent")
+    ax.plot(res["t"] / 1e3, res["v"], color=color, lw=2, label="bus voltage")
+    ax.axhline(V_THR, color="purple", ls="--", lw=1, label=f"threshold {V_THR} V")
+    for ts in res["t_s"]:
+        ax.axvline(ts / 1e3, color="gray", lw=0.6, alpha=0.4)
+    ok = ~res["errors"]
+    y_s = np.where(res["sampled"] == 0, V_DOM, 0.0)
+    ax.scatter(res["t_s"][ok] / 1e3, y_s[ok], color="green", s=25, zorder=5, label="sample OK")
+    ax.scatter(res["t_s"][~ok] / 1e3, y_s[~ok], color="red", s=70, zorder=5,
+               marker="X", label="bit error")
+    ax.set_ylabel("Vdiff (V)")
+    ax.set_ylim(-0.3, V_DOM + 0.4)
+    n_err = int(res["errors"].sum())
+    ax.set_title(f"{title}   |   errors: {n_err}/{len(BITS)}   |   "
+                 f"time left at sample point: {res['margin']:.0f} ns", fontsize=10)
+    ax.grid(alpha=0.25)
+
+
+def run_comparison(args):
+    sharp = simulate(args.sharp, args.bitrate, args.length, args.sample_point)
+    slow = simulate(args.slow, args.bitrate, args.length, args.sample_point)
+
+    fig, axes = plt.subplots(2, 1, figsize=(13, 7), sharex=True)
+    plot_scope(axes[0], sharp, f"SHARP edge (t10-90 = {args.sharp:.0f} ns)", "tab:blue")
+    plot_scope(axes[1], slow, f"SLOW edge (t10-90 = {args.slow:.0f} ns)", "tab:orange")
+    axes[1].set_xlabel("time (us)")
+    axes[0].legend(loc="upper right", ncol=5, fontsize=8)
+    fig.suptitle(f"CAN bus @ {args.bitrate:.0f} kbit/s, {args.length:.0f} m bus, "
+                 f"sample point {args.sample_point:.0f}%", fontweight="bold")
+    fig.tight_layout()
+    fig.savefig("can_edges_comparison.png", dpi=150)
+
+    print(f"\nCAN @ {args.bitrate:.0f} kbit/s | bus {args.length:.0f} m | "
+          f"sample point {args.sample_point:.0f}% | bit time {sharp['bit_time']:.0f} ns")
+    print(f"{'':28}{'SHARP':>12}{'SLOW':>12}")
+    rows = [
+        ("t10-90 (ns)", args.sharp, args.slow),
+        ("loop delay (ns)", sharp["delay"], slow["delay"]),
+        ("rise to threshold (ns)", sharp["t_rise"], slow["t_rise"]),
+        ("fall to threshold (ns)", sharp["t_fall"], slow["t_fall"]),
+        ("time left at sample (ns)", sharp["margin"], slow["margin"]),
+        ("bit errors", int(sharp["errors"].sum()), int(slow["errors"].sum())),
+        ("max bit rate (kbit/s)", sharp["max_br"], slow["max_br"]),
+    ]
+    for name, a, b in rows:
+        print(f"{name:28}{a:12.0f}{b:12.0f}")
+
+
+def run_sweep(args):
+    rates = [125, 250, 500, 1000]
+    edges = [("sharp", args.sharp, "tab:blue"), ("slow", args.slow, "tab:orange")]
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    x = np.arange(len(rates))
+    w = 0.35
+    for k, (name, tr, col) in enumerate(edges):
+        errs = [int(simulate(tr, r, args.length, args.sample_point)["errors"].sum())
+                for r in rates]
+        ax.bar(x + (k - 0.5) * w, errs, w, label=f"{name} ({tr:.0f} ns)", color=col)
+        print(f"{name:6} errors vs bit rate {rates} kbit/s: {errs}")
+    ax.set_xticks(x)
+    ax.set_xticklabels([f"{r} kbit/s" for r in rates])
+    ax.set_ylabel(f"bit errors (out of {len(BITS)})")
+    ax.set_title("Slow edges force a lower CAN bit rate")
+    ax.legend()
+    ax.grid(axis="y", alpha=0.25)
+    fig.tight_layout()
+    fig.savefig("can_errors_vs_bitrate.png", dpi=150)
+
+
+def main():
+    p = argparse.ArgumentParser(description="CAN sharp vs slow edge simulation")
+    p.add_argument("--bitrate", type=float, default=1000, help="kbit/s (default 1000)")
+    p.add_argument("--sharp", type=float, default=40, help="sharp edge t10-90 in ns")
+    p.add_argument("--slow", type=float, default=900, help="slow edge t10-90 in ns")
+    p.add_argument("--length", type=float, default=40, help="bus length in m")
+    p.add_argument("--sample-point", type=float, default=75, help="sample point in %%")
+    p.add_argument("--sweep", action="store_true", help="errors vs bit rate bar chart")
+    p.add_argument("--no-show", action="store_true", help="save PNGs without opening windows")
+    args = p.parse_args()
+
+    run_comparison(args)
+    if args.sweep:
+        run_sweep(args)
+    if not args.no_show:
+        plt.show()
+
+
+if __name__ == "__main__":
+    main()
